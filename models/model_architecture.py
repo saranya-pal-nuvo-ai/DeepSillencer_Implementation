@@ -5,32 +5,6 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
-# class PositionalEncoding(nn.Module):
-#     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-#         super().__init__()
-#         self.dropout = nn.Dropout(dropout)
-
-#         pe = torch.zeros(max_len, d_model)
-#         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-#         div_term = torch.exp(
-#             torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
-#         )
-#         pe[:, 0::2] = torch.sin(position * div_term)
-#         pe[:, 1::2] = torch.cos(position * div_term)
-#         pe = pe.unsqueeze(0)  
-
-#         self.register_buffer("pe", pe)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         x: Tensor of shape (batch_size, seq_len, d_model)
-#         """
-#         seq_len = x.size(1)
-#         x = x + self.pe[:, :seq_len]
-#         return self.dropout(x)
-
-
-
 class ConvNetXtBlock(nn.Module):
     def __init__(
             self,
@@ -193,7 +167,6 @@ class TransformerEncoder(nn.Module):
         super().__init__()
 
 
-        # self.pos_encoder = PositionalEncoding(d_model, dropout=dropout, max_len=max_len)
         self.in_proj = nn.Linear(in_dim, d_model) if in_dim != d_model else nn.Identity()
         self.encoder_layers = nn.ModuleList()
         
@@ -212,8 +185,55 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x, mask=None):
         x = self.in_proj(x)           # (B, L, d_model)
-        # x = self.pos_encoder(x)
         for layer in self.encoder_layers:
             x = layer(x, mask)
         x = self.norm(x)              # (B, L, d_model)
         return x
+    
+
+
+
+class DeepSilencer(nn.Module):
+    def __init__(self, d_model: int = 128, num_layers: int = 4, nhead: int = 4,
+                 dim_ff: int = 128 * 4, dropout: float = 0.1,
+                 in_dim: int = 640, tr_dim: int | None = None):
+        super().__init__()
+        self.transformer = TransformerEncoder(
+            in_dim=in_dim,
+            num_layers=num_layers,
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_ff,
+            dropout=dropout
+        )
+
+        self.tr_proj = None
+        if tr_dim is not None and tr_dim > 0:
+            self.tr_proj = nn.Sequential(
+                nn.LayerNorm(tr_dim),
+                nn.Linear(tr_dim, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model)
+            )
+       
+        self.convnext = ConvNetXtEncoder(dropout=dropout)
+
+
+    def forward_once(self, x, tr=None):
+        # x: (B, L, in_dim)
+        h = self.transformer(x)  # (B, L, d_model)
+        
+        if self.tr_proj is not None and tr is not None:
+            b = self.tr_proj(tr)           # (B, d_model)
+            h = h + b.unsqueeze(1)         # add as bias to each token
+        h = h.transpose(1, 2)              # (B, d_model, L)
+        
+        y_reg, y_cls = self.convnext(h)
+        return y_reg, y_cls
+    
+
+    def forward(self, e1, e2, tr1=None, tr2=None):
+        y1_reg, y1_cls = self.forward_once(e1, tr1)
+        y2_reg, y2_cls = self.forward_once(e2, tr2)
+        return (y1_reg, y1_cls, y2_reg, y2_cls)
+    
