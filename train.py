@@ -11,7 +11,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from data.DataLoader import preprocess_data, transform_data
+from sklearn.metrics import roc_auc_score
+from scipy.stats import pearsonr, spearmanr
+
+from data.Dataloader import preprocess_data, transform_data
 from models.model_architecture import ConvNetXtEncoder, TransformerEncoder
 
 
@@ -49,72 +52,59 @@ def classification_loss_from_probs(y_prob: torch.Tensor, y_true: torch.Tensor):
 
 
 
-# def selective_pair_sampling(df, as_idx, alpha1, alpha2):
-#     n = len(df)
-#     i = torch.randint(low=0, high=n, size=(1,)).item()
-
-#     while i != as_idx:
-#         cnt += 1
-#         if i != as_idx and alpha1 <= np.abs(df.iloc[i]['label'] - df.iloc[as_idx]['label']) <= alpha2:
-#             return as_idx, i
-#         else:
-#             i = torch.randint(low=0, high=n, size=(1,)).item()
-
 
 class SelectivePairDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, sirna_embeddings, tr_features: np.ndarray | None,
-                 alpha1: float = 0.05, alpha2: float = 0.20, threshold: float = 0.70):
+    def __init__(self, 
+                 df: pd.DataFrame, 
+                 sirna_embeddings, 
+                 tr_features: np.ndarray | None, 
+                 alpha1: float = 0.05, 
+                 alpha2: float = 0.20, 
+                ):
+                #  threshold: float = 0.70):
+        
         self.df = df.reset_index(drop=True)
         self.sirna_embeddings = sirna_embeddings
         self.tr_features = tr_features
         self.alpha1 = alpha1
         self.alpha2 = alpha2
-        self.threshold = threshold
         self.n = len(self.df)
 
-        # ensure labels in [0,1]
-        if self.df['label'].max() > 1.0:
-            self.df['label'] = self.df['label'] / 100.0
-
         self.labels = self.df['label'].to_numpy(dtype=np.float32)
-        self.cls_labels = (self.labels >= self.threshold).astype(np.int64)
+        self.cls_labels = self.df['y'].astype(np.int64)
 
-        # sanity check for alignment
-        if len(self.sirna_embeddings) != self.n:
-            raise ValueError(f"Embeddings length {len(self.sirna_embeddings)} != dataframe rows {self.n}")
-        if self.tr_features is not None and len(self.tr_features) != self.n:
-            raise ValueError("TR feature rows do not match dataframe rows")
+
+
 
     def __len__(self):
         # Each __getitem__ returns one pair. You can oversample by scaling this if needed.
         return self.n
+    
 
-    def _sample_pair_for_anchor(self, as_idx: int):
-        # dynamic random pairing until condition met
-        # NOTE: guards against infinite loops by capping trials
+
+    def _sample_pair_for_anchor(self, as_idx: int, MAX_LIM=10000):
         y_as = self.labels[as_idx]
-        for _ in range(1000):
+
+        for _ in range(MAX_LIM):
             j = torch.randint(low=0, high=self.n, size=(1,)).item()
             if j == as_idx:
                 continue
             if self.alpha1 <= abs(self.labels[j] - y_as) <= self.alpha2:
                 return as_idx, j
-        # fallback: random j if condition failed after many tries
+            
+        #   Just in case, the loop runs out and no j is chosen.....
         j = torch.randint(low=0, high=self.n, size=(1,)).item()
         return as_idx, j
+
+
 
     def __getitem__(self, _):
         as_idx = torch.randint(low=0, high=self.n, size=(1,)).item()
         i, j = self._sample_pair_for_anchor(as_idx)
 
-        emb_i = self.sirna_embeddings[i]  # (21, 640)
-        emb_j = self.sirna_embeddings[j]  # (21, 640)
+        emb_i = torch.tensor(self.sirna_embeddings[i], dtype=torch.float32)  # (21, 640)
+        emb_j = torch.tensor(self.sirna_embeddings[j], dtype=torch.float32)  # (21, 640)
 
-        # convert to tensors if not already
-        if not torch.is_tensor(emb_i):
-            emb_i = torch.tensor(emb_i, dtype=torch.float32)
-        if not torch.is_tensor(emb_j):
-            emb_j = torch.tensor(emb_j, dtype=torch.float32)
 
         y1 = torch.tensor(self.labels[i], dtype=torch.float32)
         y2 = torch.tensor(self.labels[j], dtype=torch.float32)
@@ -128,17 +118,9 @@ class SelectivePairDataset(Dataset):
             tr1 = torch.tensor([])
             tr2 = torch.tensor([])
 
-        return emb_i, emb_j, y1, y2, c1, c2, tr1, tr2
+        return emb_i, emb_j, y1, y2, c1, c2, tr1, tr2       #   All of these returned values are torch.tensors
     
 
-
-
-
-# def make_a_batch(batch_size, start_idx, sirna_emb, mrna_emb, alpha1, alpha2):
-#     batch_list = []
-#     for _ in range(batch_size):
-#         i, j = selective_pair_sampling(combined_df, start_idx, 0.1, 0.5)
-#         batch_list.append( (i,j) )
 
     
 
@@ -177,24 +159,31 @@ class DeepSilencer(nn.Module):
             dim_feedforward=dim_ff,
             dropout=dropout
         )
+
         self.tr_proj = None
         if tr_dim is not None and tr_dim > 0:
             self.tr_proj = nn.Sequential(
+                nn.LayerNorm(tr_dim),
                 nn.Linear(tr_dim, d_model),
                 nn.GELU(),
                 nn.Linear(d_model, d_model)
             )
+       
         self.convnext = ConvNetXtEncoder(dropout=dropout)
+
 
     def forward_once(self, x, tr=None):
         # x: (B, L, in_dim)
         h = self.transformer(x)  # (B, L, d_model)
+        
         if self.tr_proj is not None and tr is not None:
             b = self.tr_proj(tr)           # (B, d_model)
             h = h + b.unsqueeze(1)         # add as bias to each token
         h = h.transpose(1, 2)              # (B, d_model, L)
+        
         y_reg, y_cls = self.convnext(h)
         return y_reg, y_cls
+    
 
     def forward(self, e1, e2, tr1=None, tr2=None):
         y1_reg, y1_cls = self.forward_once(e1, tr1)
@@ -213,6 +202,13 @@ def train_epoch(model, loader, optimizer, device, beta_reg: float, lambda_cont: 
     loss_reg_meter = 0.0
     loss_cont_meter = 0.0
 
+    all_y1 = []
+    all_y1_pred = []
+    all_y2 = []
+    all_y2_pred = []
+    all_c1 = []
+    all_p1 = []
+
     for batch in loader:
         e1, e2, y1, y2, c1, c2, tr1, tr2 = batch
         e1 = e1.to(device)
@@ -220,7 +216,6 @@ def train_epoch(model, loader, optimizer, device, beta_reg: float, lambda_cont: 
         y1 = y1.to(device)
         y2 = y2.to(device)
         c1 = c1.to(device)
-        # c2 is not used in cls loss (by design), but move to device to keep symmetry
         c2 = c2.to(device)
         if tr1 is not None:
             tr1 = tr1.to(device)
@@ -228,13 +223,12 @@ def train_epoch(model, loader, optimizer, device, beta_reg: float, lambda_cont: 
 
         y1_pred, p1, y2_pred, p2 = model(e1, e2, tr1, tr2)
 
-        # losses
-        loss_cls = classification_loss_from_probs(p1, c1)
+        
+        loss_cls = classification_loss_from_probs(p1, c1)  # binary classification loss
         loss_reg = smooth_l1_beta(y1_pred, y1, beta_reg) + smooth_l1_beta(y2_pred, y2, beta_reg)
         diff_pred = y1_pred - y2_pred
         diff_true = y1 - y2
         loss_cont = smooth_l1_beta(diff_pred, diff_true, beta_reg)
-
         loss = loss_cls + loss_reg + lambda_cont * loss_cont
 
         optimizer.zero_grad(set_to_none=True)
@@ -249,12 +243,48 @@ def train_epoch(model, loader, optimizer, device, beta_reg: float, lambda_cont: 
         loss_reg_meter += loss_reg.item() * bs
         loss_cont_meter += loss_cont.item() * bs
 
+        
+        all_y1.append(y1.detach().cpu().numpy())
+        all_y1_pred.append(y1_pred.detach().cpu().numpy())
+        all_y2.append(y2.detach().cpu().numpy())
+        all_y2_pred.append(y2_pred.detach().cpu().numpy())
+        all_c1.append(c1.detach().cpu().numpy())
+        all_p1.append(p1.detach().cpu().numpy()[:, 1])
+
+
+    y1_true = np.concatenate(all_y1)
+    y1_pred = np.concatenate(all_y1_pred)
+    y2_true = np.concatenate(all_y2)
+    y2_pred = np.concatenate(all_y2_pred)
+    c1_true = np.concatenate(all_c1)
+    p1_pos_prob = np.concatenate(all_p1)
+
+    # Safe metric calculation helper
+    def safe_metric(f, x, y):
+        try:
+            return f(x, y)[0]
+        except Exception:
+            return np.nan
+
+    pcc1 = safe_metric(pearsonr, y1_true.ravel(), y1_pred.ravel())
+    pcc2 = safe_metric(pearsonr, y2_true.ravel(), y2_pred.ravel())
+    spcc1 = safe_metric(spearmanr, y1_true.ravel(), y1_pred.ravel())
+    spcc2 = safe_metric(spearmanr, y2_true.ravel(), y2_pred.ravel())
+    roc_auc = roc_auc_score(c1_true, p1_pos_prob)
+
     return {
         'loss': loss_meter / total,
         'loss_cls': loss_cls_meter / total,
         'loss_reg': loss_reg_meter / total,
         'loss_cont': loss_cont_meter / total,
+        'PCC_y1': pcc1,
+        'PCC_y2': pcc2,
+        'SPCC_y1': spcc1,
+        'SPCC_y2': spcc2,
+        'ROC_AUC': roc_auc,
     }
+
+
 
 
 
@@ -266,6 +296,14 @@ def evaluate_epoch(model, loader, device, beta_reg: float, lambda_cont: float = 
     loss_cls_meter = 0.0
     loss_reg_meter = 0.0
     loss_cont_meter = 0.0
+
+    all_y1 = []
+    all_y1_pred = []
+    all_y2 = []
+    all_y2_pred = []
+    all_c1 = []
+    all_p1 = []
+
 
     with torch.no_grad():
         for batch in loader:
@@ -297,12 +335,85 @@ def evaluate_epoch(model, loader, device, beta_reg: float, lambda_cont: float = 
             loss_reg_meter += loss_reg.item() * bs
             loss_cont_meter += loss_cont.item() * bs
 
+
+
+            all_y1.append(y1.detach().cpu().numpy())
+            all_y1_pred.append(y1_pred.detach().cpu().numpy())
+            all_y2.append(y2.detach().cpu().numpy())
+            all_y2_pred.append(y2_pred.detach().cpu().numpy())
+            all_c1.append(c1.detach().cpu().numpy())
+            all_p1.append(p1.detach().cpu().numpy()[:, 1]) 
+
+ 
+    y1_true = np.concatenate(all_y1)
+    y1_pred = np.concatenate(all_y1_pred)
+    y2_true = np.concatenate(all_y2)
+    y2_pred = np.concatenate(all_y2_pred)
+    c1_true = np.concatenate(all_c1)
+    p1_pos_prob = np.concatenate(all_p1)
+
+    def safe_metric(f, x, y):
+        try:
+            return f(x, y)[0]
+        except Exception:
+            return np.nan
+
+    pcc1 = safe_metric(pearsonr, y1_true.ravel(), y1_pred.ravel())
+    pcc2 = safe_metric(pearsonr, y2_true.ravel(), y2_pred.ravel())
+    spcc1 = safe_metric(spearmanr, y1_true.ravel(), y1_pred.ravel())
+    spcc2 = safe_metric(spearmanr, y2_true.ravel(), y2_pred.ravel())
+    roc_auc = roc_auc_score(c1_true, p1_pos_prob)
+
     return {
         'loss': loss_meter / total,
         'loss_cls': loss_cls_meter / total,
         'loss_reg': loss_reg_meter / total,
         'loss_cont': loss_cont_meter / total,
+        'PCC_y1': pcc1,
+        'PCC_y2': pcc2,
+        'SPCC_y1': spcc1,
+        'SPCC_y2': spcc2,
+        'ROC_AUC': roc_auc,
     }
+
+
+
+def train_test_split(df, sirna_embeddings, mrna_embeddings, bio_features_df=None, test_size=0.2, seed=None):
+    n = len(df)
+    if seed is not None:
+        np.random.seed(seed)
+
+    idxs = np.random.permutation(n)
+    split = int(n * (1 - test_size))
+
+    tr_idx = idxs[:split].tolist()
+    test_idx = idxs[split:].tolist()
+
+    df_train = df.iloc[tr_idx]
+    df_test = df.iloc[test_idx]
+
+    sirna_train = [sirna_embeddings[i] for i in tr_idx]
+    sirna_test = [sirna_embeddings[i] for i in test_idx]
+
+    mrna_train = [mrna_embeddings[i] for i in tr_idx]
+    mrna_test = [mrna_embeddings[i] for i in test_idx]
+
+    if bio_features_df is not None:
+        bio_features_array = bio_features_df.to_numpy(dtype=np.float32)
+        
+        bio_train = bio_features_array[tr_idx]
+        tr_dim = bio_train.shape[1]
+        
+        bio_test = bio_features_array[test_idx]
+        test_dm = bio_test.shape[1]
+    else:
+        bio_train = None
+        tr_dim = None
+        bio_test = None
+        test_dm = None
+
+    return df_train, df_test, sirna_train, sirna_test, mrna_train, mrna_test, bio_train, bio_test, tr_dim, test_dm
+
 
 
 
@@ -318,56 +429,42 @@ if __name__ == '__main__':
     base_path = os.getenv('DATA_PATH')
     CACHE_PATH = os.getenv('CACHE_PATH')
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    combined_df = transform_data(base_path)  
 
-    # Load / transform data
-    combined_df = transform_data(base_path)  # must contain a 'label' column scaled either to 0-1 or 0-100
-
-    # returns: siRNA_seq, siRNA_embeddings(list[(21,640)]), mRNA_embeddings(list[(59,640)]), bio_features_df (np.array or df)
     siRNA_seq, siRNA_embeddings, mRNA_embeddings, bio_features_df = preprocess_data(
         base_path, CACHE_PATH, bio_features_return=True
     )
 
-    # optional TR features (thermodynamic etc.)
-    if bio_features_df is not None:
-        if isinstance(bio_features_df, pd.DataFrame):
-            tr_features = bio_features_df.to_numpy(dtype=np.float32)
-        else:
-            tr_features = np.asarray(bio_features_df, dtype=np.float32)
-        tr_dim = tr_features.shape[1]
-    else:
-        tr_features = None
-        tr_dim = None
 
-    # Dataset / loaders
+    com_df_train, com_df_test, sirna_train, sirna_test, mrna_train, mrna_test, tr_train, tr_test, tr_dim, test_dm = train_test_split(combined_df, siRNA_embeddings, mRNA_embeddings, bio_features_df, test_size=0.2)
+    print(com_df_train.shape, com_df_test.shape)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     alpha1 = 0.05
     alpha2 = 0.20
-    threshold = 0.70
-
-    train_ds = SelectivePairDataset(combined_df, siRNA_embeddings, tr_features, alpha1, alpha2, threshold)
-    # for simplicity, use the same for eval here; you should split combined_df for real experiments
-    val_ds = SelectivePairDataset(combined_df, siRNA_embeddings, tr_features, alpha1, alpha2, threshold)
+ 
+    train_ds = SelectivePairDataset(com_df_train, sirna_train, tr_train, alpha1, alpha2)
+    val_ds = SelectivePairDataset(com_df_test, sirna_test, tr_test, alpha1, alpha2)
 
     batch_size = int(os.getenv('BATCH_SIZE', 64))
     num_workers = int(os.getenv('NUM_WORKERS', 4))
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn, drop_last=False)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                              pin_memory=True, collate_fn=collate_fn, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                            pin_memory=True, collate_fn=collate_fn, drop_last=False)
 
-    # Model
     model = DeepSilencer(
         d_model=128, num_layers=4, nhead=4, dim_ff=128 * 4, dropout=0.1,
         in_dim=640, tr_dim=(tr_dim if tr_dim is not None else 0)
     ).to(device)
 
-    # Optimizer
+    
     lr = float(os.getenv('LEARNING_RATE', 3e-4))
     weight_decay = float(os.getenv('WEIGHT_DECAY', 1e-4))
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
-    # Loss hyperparameters
+    
     # If labels are scaled to 0-1, use beta_reg = 0.024; if 0-100, use 2.4
     beta_reg = float(os.getenv('BETA_REG', 0.024))
     lambda_cont = float(os.getenv('LAMBDA_CONT', 2.0))
@@ -383,8 +480,11 @@ if __name__ == '__main__':
         va_metrics = evaluate_epoch(model, val_loader, device, beta_reg, lambda_cont)
 
         print(f"Epoch {epoch:03d} | "
-              f"train loss {tr_metrics['loss']:.4f} (cls {tr_metrics['loss_cls']:.4f} reg {tr_metrics['loss_reg']:.4f} cont {tr_metrics['loss_cont']:.4f}) | "
-              f"val loss {va_metrics['loss']:.4f} (cls {va_metrics['loss_cls']:.4f} reg {va_metrics['loss_reg']:.4f} cont {va_metrics['loss_cont']:.4f})")
+            f"train loss {tr_metrics['loss']:.4f} | "
+            f"train PCC_y1 {tr_metrics['PCC_y1']:.4f} SPCC_y1 {tr_metrics['SPCC_y1']:.4f} ROC_AUC {tr_metrics['ROC_AUC']:.4f} | "
+            f"val loss {va_metrics['loss']:.4f} | "
+            f"val PCC_y1 {va_metrics['PCC_y1']:.4f} SPCC_y1 {va_metrics['SPCC_y1']:.4f} ROC_AUC {va_metrics['ROC_AUC']:.4f}")
+
 
         # save best by total val loss
         if va_metrics['loss'] < best_val:
@@ -398,9 +498,8 @@ if __name__ == '__main__':
                 'lambda_cont': lambda_cont,
                 'alpha1': alpha1,
                 'alpha2': alpha2,
-                'threshold': threshold,
-            }
-            torch.save(ckpt, ckpt_dir / 'deepsilencer_best.pt')
+        }
+        torch.save(ckpt, ckpt_dir / 'deepsilencer_best.pt')
 
     # quick smoke test of sampler
     for _ in range(5):

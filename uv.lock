@@ -120,6 +120,8 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "rna-fm" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "torch" },
     { name = "tqdm" },
 ]
@@ -132,6 +134,8 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.3.1" },
     { name = "pandas", specifier = ">=2.3.1" },
     { name = "rna-fm", specifier = ">=0.2.2" },
+    { name = "scikit-learn", specifier = ">=1.7.1" },
+    { name = "scipy", specifier = ">=1.16.0" },
     { name = "torch", specifier = ">=2.7.1" },
     { name = "tqdm", specifier = ">=4.67.1" },
 ]

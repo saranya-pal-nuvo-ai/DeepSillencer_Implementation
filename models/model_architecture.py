@@ -1,7 +1,34 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+
+
+# class PositionalEncoding(nn.Module):
+#     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+#         super().__init__()
+#         self.dropout = nn.Dropout(dropout)
+
+#         pe = torch.zeros(max_len, d_model)
+#         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+#         div_term = torch.exp(
+#             torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+#         )
+#         pe[:, 0::2] = torch.sin(position * div_term)
+#         pe[:, 1::2] = torch.cos(position * div_term)
+#         pe = pe.unsqueeze(0)  
+
+#         self.register_buffer("pe", pe)
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         x: Tensor of shape (batch_size, seq_len, d_model)
+#         """
+#         seq_len = x.size(1)
+#         x = x + self.pe[:, :seq_len]
+#         return self.dropout(x)
+
 
 
 class ConvNetXtBlock(nn.Module):
@@ -160,10 +187,13 @@ class TransformerEncoder(nn.Module):
             d_model=128,
             nhead=4,
             dim_feedforward=128*4,
-            dropout=0.1
+            dropout=0.1,
+            max_len=21
         ):
         super().__init__()
 
+
+        # self.pos_encoder = PositionalEncoding(d_model, dropout=dropout, max_len=max_len)
         self.in_proj = nn.Linear(in_dim, d_model) if in_dim != d_model else nn.Identity()
         self.encoder_layers = nn.ModuleList()
         
@@ -182,6 +212,7 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x, mask=None):
         x = self.in_proj(x)           # (B, L, d_model)
+        # x = self.pos_encoder(x)
         for layer in self.encoder_layers:
             x = layer(x, mask)
         x = self.norm(x)              # (B, L, d_model)
