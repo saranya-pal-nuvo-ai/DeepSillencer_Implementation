@@ -15,7 +15,7 @@ from sklearn.metrics import roc_auc_score
 from scipy.stats import pearsonr, spearmanr
 
 from data.Dataloader import preprocess_data, transform_data
-from models.model_architecture import ConvNetXtEncoder, TransformerEncoder
+from models.model_architecture import CombinedSilencer
 
 
 def set_seed(seed: int = 111):
@@ -56,7 +56,8 @@ def classification_loss_from_probs(y_prob: torch.Tensor, y_true: torch.Tensor):
 class SelectivePairDataset(Dataset):
     def __init__(self, 
                  df: pd.DataFrame, 
-                 sirna_embeddings, 
+                 sirna_embeddings,
+                 mrna_embeddings,
                  tr_features: np.ndarray | None, 
                  alpha1: float = 0.05, 
                  alpha2: float = 0.20, 
@@ -65,6 +66,7 @@ class SelectivePairDataset(Dataset):
         
         self.df = df.reset_index(drop=True)
         self.sirna_embeddings = sirna_embeddings
+        self.mrna_embeddings  = mrna_embeddings
         self.tr_features = tr_features
         self.alpha1 = alpha1
         self.alpha2 = alpha2
@@ -104,6 +106,8 @@ class SelectivePairDataset(Dataset):
 
         emb_i = torch.tensor(self.sirna_embeddings[i], dtype=torch.float32)  # (21, 640)
         emb_j = torch.tensor(self.sirna_embeddings[j], dtype=torch.float32)  # (21, 640)
+        mrna_i = torch.tensor(self.mrna_embeddings[i], dtype=torch.float32)  # (59,640)
+        mrna_j = torch.tensor(self.mrna_embeddings[j], dtype=torch.float32)
 
 
         y1 = torch.tensor(self.labels[i], dtype=torch.float32)
@@ -118,18 +122,24 @@ class SelectivePairDataset(Dataset):
             tr1 = torch.tensor([])
             tr2 = torch.tensor([])
 
-        return emb_i, emb_j, y1, y2, c1, c2, tr1, tr2       #   All of these returned values are torch.tensors
+        return emb_i, emb_j, mrna_i, mrna_j, y1, y2, c1, c2, tr1, tr2      #   All of these returned values are torch.tensors
     
 
 
     
 
 def collate_fn(batch):
-    e1, e2, y1, y2, c1, c2, tr1, tr2 = zip(*batch)
+    e1, e2, m1, m2, y1, y2, c1, c2, tr1, tr2 = zip(*batch)
+    
     e1 = torch.stack(e1, dim=0)  # (B, 21, 640)
     e2 = torch.stack(e2, dim=0)  # (B, 21, 640)
+    
+    m1 = torch.stack(m1, dim=0)  # (B, 59, 640)
+    m2 = torch.stack(m2, dim=0)
+    
     y1 = torch.stack(y1, dim=0)
     y2 = torch.stack(y2, dim=0)
+    
     c1 = torch.stack(c1, dim=0)
     c2 = torch.stack(c2, dim=0)
 
@@ -141,55 +151,8 @@ def collate_fn(batch):
         tr1 = None
         tr2 = None
 
-    return e1, e2, y1, y2, c1, c2, tr1, tr2
+    return e1, e2, m1, m2, y1, y2, c1, c2, tr1, tr2
 
-
-
-
-class DeepSilencer(nn.Module):
-    def __init__(self, d_model: int = 128, num_layers: int = 4, nhead: int = 4,
-                 dim_ff: int = 128 * 4, dropout: float = 0.1,
-                 in_dim: int = 640, tr_dim: int | None = None):
-        super().__init__()
-        self.transformer = TransformerEncoder(
-            in_dim=in_dim,
-            num_layers=num_layers,
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_ff,
-            dropout=dropout
-        )
-
-        self.tr_proj = None
-        if tr_dim is not None and tr_dim > 0:
-            self.tr_proj = nn.Sequential(
-                nn.LayerNorm(tr_dim),
-                nn.Linear(tr_dim, d_model),
-                nn.GELU(),
-                nn.Linear(d_model, d_model)
-            )
-       
-        self.convnext = ConvNetXtEncoder(dropout=dropout)
-
-
-    def forward_once(self, x, tr=None):
-        # x: (B, L, in_dim)
-        h = self.transformer(x)  # (B, L, d_model)
-        
-        if self.tr_proj is not None and tr is not None:
-            b = self.tr_proj(tr)           # (B, d_model)
-            h = h + b.unsqueeze(1)         # add as bias to each token
-        h = h.transpose(1, 2)              # (B, d_model, L)
-        
-        y_reg, y_cls = self.convnext(h)
-        return y_reg, y_cls
-    
-
-    def forward(self, e1, e2, tr1=None, tr2=None):
-        y1_reg, y1_cls = self.forward_once(e1, tr1)
-        y2_reg, y2_cls = self.forward_once(e2, tr2)
-        return (y1_reg, y1_cls, y2_reg, y2_cls)
-    
 
 
 
@@ -210,9 +173,11 @@ def train_epoch(model, loader, optimizer, device, beta_reg: float, lambda_cont: 
     all_p1 = []
 
     for batch in loader:
-        e1, e2, y1, y2, c1, c2, tr1, tr2 = batch
+        e1, e2, m1, m2, y1, y2, c1, c2, tr1, tr2 = batch
         e1 = e1.to(device)
         e2 = e2.to(device)
+        m1 = m1.to(device)
+        m2 = m2.to(device)
         y1 = y1.to(device)
         y2 = y2.to(device)
         c1 = c1.to(device)
@@ -221,15 +186,18 @@ def train_epoch(model, loader, optimizer, device, beta_reg: float, lambda_cont: 
             tr1 = tr1.to(device)
             tr2 = tr2.to(device)
 
-        y1_pred, p1, y2_pred, p2 = model(e1, e2, tr1, tr2)
+        y1_pred, p1, y2_pred, p2 = model(e1, e2, m1, m2, tr1, tr2)
 
         
-        loss_cls = classification_loss_from_probs(p1, c1)  # binary classification loss
-        loss_reg = smooth_l1_beta(y1_pred, y1, beta_reg) + smooth_l1_beta(y2_pred, y2, beta_reg)
-        diff_pred = y1_pred - y2_pred
-        diff_true = y1 - y2
-        loss_cont = smooth_l1_beta(diff_pred, diff_true, beta_reg)
-        loss = loss_cls + loss_reg + lambda_cont * loss_cont
+        # loss_cls = classification_loss_from_probs(p1, c1)  # binary classification loss
+        # loss_reg = smooth_l1_beta(y1_pred, y1, beta_reg) + smooth_l1_beta(y2_pred, y2, beta_reg)
+        # diff_pred = y1_pred - y2_pred
+        # diff_true = y1 - y2
+        # loss_cont = smooth_l1_beta(diff_pred, diff_true, beta_reg)
+        # loss = loss_cls + loss_reg + lambda_cont * loss_cont
+
+        mse = nn.MSELoss()
+        loss = mse(y1_pred, y1) + mse(y2_pred, y2)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -239,9 +207,9 @@ def train_epoch(model, loader, optimizer, device, beta_reg: float, lambda_cont: 
         bs = e1.size(0)
         total += bs
         loss_meter += loss.item() * bs
-        loss_cls_meter += loss_cls.item() * bs
-        loss_reg_meter += loss_reg.item() * bs
-        loss_cont_meter += loss_cont.item() * bs
+        # loss_cls_meter += loss_cls.item() * bs
+        # loss_reg_meter += loss_reg.item() * bs
+        # loss_cont_meter += loss_cont.item() * bs
 
         
         all_y1.append(y1.detach().cpu().numpy())
@@ -307,9 +275,11 @@ def evaluate_epoch(model, loader, device, beta_reg: float, lambda_cont: float = 
 
     with torch.no_grad():
         for batch in loader:
-            e1, e2, y1, y2, c1, c2, tr1, tr2 = batch
+            e1, e2, m1, m2, y1, y2, c1, c2, tr1, tr2 = batch
             e1 = e1.to(device)
             e2 = e2.to(device)
+            m1 = m1.to(device)
+            m2 = m2.to(device)
             y1 = y1.to(device)
             y2 = y2.to(device)
             c1 = c1.to(device)
@@ -318,7 +288,7 @@ def evaluate_epoch(model, loader, device, beta_reg: float, lambda_cont: float = 
                 tr1 = tr1.to(device)
                 tr2 = tr2.to(device)
 
-            y1_pred, p1, y2_pred, p2 = model(e1, e2, tr1, tr2)
+            y1_pred, p1, y2_pred, p2 = model(e1, e2, m1, m2, tr1, tr2)
 
             loss_cls = classification_loss_from_probs(p1, c1)
             loss_reg = smooth_l1_beta(y1_pred, y1, beta_reg) + smooth_l1_beta(y2_pred, y2, beta_reg)
@@ -444,8 +414,8 @@ if __name__ == '__main__':
     alpha1 = 0.05
     alpha2 = 0.20
  
-    train_ds = SelectivePairDataset(com_df_train, sirna_train, tr_train, alpha1, alpha2)
-    val_ds = SelectivePairDataset(com_df_test, sirna_test, tr_test, alpha1, alpha2)
+    train_ds = SelectivePairDataset(com_df_train, sirna_train, mrna_train,  tr_train, alpha1, alpha2)
+    val_ds = SelectivePairDataset(com_df_test, sirna_test, mrna_test, tr_test, alpha1, alpha2)
 
     batch_size = int(os.getenv('BATCH_SIZE', 64))
     num_workers = int(os.getenv('NUM_WORKERS', 4))
@@ -453,10 +423,24 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, collate_fn=collate_fn, drop_last=False)
 
 
-    model = DeepSilencer(
+    model = CombinedSilencer(
         d_model=128, num_layers=4, nhead=4, dim_ff=128 * 4, dropout=0.1,
-        in_dim=640, tr_dim=(tr_dim if tr_dim is not None else 0)
+        sirna_dim=640, mrna_dim=640, prior_dim=(tr_dim or 0)
     ).to(device)
+
+
+
+    # def __init__(
+    #     self,
+    #     d_model: int = 128,
+    #     num_layers: int = 4,
+    #     nhead: int = 4,
+    #     dim_ff: int = 128 * 4,
+    #     dropout: float = 0.1,
+    #     sirna_dim: int = 640,
+    #     mrna_dim: int = 640,
+    #     prior_dim: int | None = None,
+    # ):
 
     
     lr = float(os.getenv('LEARNING_RATE', 3e-4))
@@ -499,9 +483,5 @@ if __name__ == '__main__':
                 'alpha1': alpha1,
                 'alpha2': alpha2,
         }
-        torch.save(ckpt, ckpt_dir / 'deepsilencer_best.pt')
-
-    # quick smoke test of sampler
-    for _ in range(5):
-        i, j = train_ds._sample_pair_for_anchor(5)
-        print('sampled pair:', i, j)
+            
+        torch.save(ckpt, ckpt_dir / 'combined_best.pt')

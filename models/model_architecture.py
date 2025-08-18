@@ -5,29 +5,29 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
-# class PositionalEncoding(nn.Module):
-#     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-#         super().__init__()
-#         self.dropout = nn.Dropout(dropout)
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
 
-#         pe = torch.zeros(max_len, d_model)
-#         position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-#         div_term = torch.exp(
-#             torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
-#         )
-#         pe[:, 0::2] = torch.sin(position * div_term)
-#         pe[:, 1::2] = torch.cos(position * div_term)
-#         pe = pe.unsqueeze(0)  
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  
 
-#         self.register_buffer("pe", pe)
+        self.register_buffer("pe", pe)
 
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         x: Tensor of shape (batch_size, seq_len, d_model)
-#         """
-#         seq_len = x.size(1)
-#         x = x + self.pe[:, :seq_len]
-#         return self.dropout(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: Tensor of shape (batch_size, seq_len, d_model)
+        """
+        seq_len = x.size(1)
+        x = x + self.pe[:, :seq_len]
+        return self.dropout(x)
 
 
 
@@ -121,6 +121,12 @@ class ConvNetXtEncoder(nn.Module):
         self.reg_head = nn.Sequential(
             nn.Flatten(1),
             nn.Dropout(dropout),
+            nn.Linear(32, 32),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 32),
+            nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(32, 1)
         )
 
@@ -128,9 +134,17 @@ class ConvNetXtEncoder(nn.Module):
         self.clas_head = nn.Sequential(
             nn.Flatten(1),
             nn.Dropout(dropout),
+            nn.Linear(32, 32),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 32),
+            nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(32, 2),
             nn.Softmax(dim=1)  #    Need to cross-verify (paper dont have mention of this)
         )
+
+
 
 
     def forward(self, x):
@@ -193,7 +207,7 @@ class TransformerEncoder(nn.Module):
         super().__init__()
 
 
-        # self.pos_encoder = PositionalEncoding(d_model, dropout=dropout, max_len=max_len)
+        self.pos_encoder = PositionalEncoding(d_model, dropout=dropout, max_len=max_len)
         self.in_proj = nn.Linear(in_dim, d_model) if in_dim != d_model else nn.Identity()
         self.encoder_layers = nn.ModuleList()
         
@@ -212,8 +226,136 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, x, mask=None):
         x = self.in_proj(x)           # (B, L, d_model)
-        # x = self.pos_encoder(x)
+        x = self.pos_encoder(x)
         for layer in self.encoder_layers:
             x = layer(x, mask)
         x = self.norm(x)              # (B, L, d_model)
         return x
+    
+
+
+
+
+
+class CombinedSilencer(nn.Module):
+    """
+    Combines DeepSilencer and AttSioff: uses two TransformerEncoders (siRNA & mRNA), prior features,
+    and a ConvNeXt backbone, followed by FFN heads.
+    """
+    def __init__(
+        self,
+        d_model: int = 128,
+        num_layers: int = 4,
+        nhead: int = 4,
+        dim_ff: int = 128 * 4,
+        dropout: float = 0.1,
+        sirna_dim: int = 640,
+        mrna_dim: int = 640,
+        prior_dim: int | None = None,
+    ):
+        super().__init__()
+        # siRNA Transformer path
+        # self.sirna_in = nn.Linear(sirna_dim, d_model)
+        self.sirna_encoder = TransformerEncoder(
+            in_dim=sirna_dim,
+            num_layers=num_layers,
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_ff,
+            dropout=dropout,
+            max_len=21,
+        )
+        # self.sirna_out = nn.Linear(d_model, d_model)
+
+        # mRNA Transformer path
+        # self.mrna_in = nn.Linear(mrna_dim, d_model)
+        self.mrna_encoder = TransformerEncoder(
+            in_dim=mrna_dim,
+            num_layers=2,
+            d_model=d_model,
+            nhead=1,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            max_len=59,
+        )
+        # self.mrna_out = nn.Linear(d_model, d_model)
+
+        # Prior knowledge (bio) features
+        if prior_dim is not None and prior_dim > 0:
+            self.prior_norm = nn.LayerNorm(prior_dim)
+            self.prior_proj = nn.Linear(prior_dim, d_model)
+        else:
+            self.prior_norm = None
+            self.prior_proj = None
+
+        # ConvNeXt backbone
+        self.convnext = ConvNetXtEncoder(dropout=dropout)
+
+        # Final FFN head (after gap)
+        # convnext.gap outputs (B, C, 1) -> (B, C)
+        # self.head = nn.Sequential(
+        #     nn.BatchNorm1d(32),
+        #     nn.Linear(32, 32),
+        #     nn.SiLU(),
+        #     nn.Dropout(dropout),
+        #     nn.Linear(32, 32),
+        #     nn.SiLU(),
+        #     nn.Dropout(dropout),
+        #     nn.Linear(32, 1),
+        #     nn.Sigmoid()
+        # )
+
+    def forward_once(self, sirna: torch.Tensor, mrna: torch.Tensor, prior: torch.Tensor | None = None):
+        # sirna: (B, 21, 640)
+        # s = self.sirna_in(sirna)            # -> (B,21,d_model)
+        s = self.sirna_encoder(sirna)          # -> (B,21,d_model)
+        # s = self.sirna_out(s)              # -> (B,21,d_model)
+
+        # mrna: (B, 59, 640)
+        # m = self.mrna_in(mrna)
+        m = self.mrna_encoder(mrna)
+        # m = self.mrna_out(m)
+
+        # prior: (B, prior_dim)
+        if self.prior_proj is not None and prior is not None:
+            p = self.prior_norm(prior)
+            p = self.prior_proj(p)           # -> (B, d_model)
+            p = p.unsqueeze(1)               # -> (B,1,d_model)
+        else:
+            p = None
+
+        # concatenate along sequence dimension
+        seqs = [s, m]
+        if p is not None:
+            seqs.append(p)
+
+        h = torch.cat(seqs, dim=1)         # -> (B, L_total, d_model)
+        # prepare for ConvNeXt: (B,d_model, L_total)
+        h = h.transpose(1, 2)
+
+        # ConvNeXt regression + classification
+        y_reg, y_cls = self.convnext(h)
+
+        # additional FFN on reg output
+        # y_reg: (B,), y_cls: (B,2)
+        # refined = self.head(y_reg.unsqueeze(1))  # -> (B,1)
+
+        return y_reg, y_cls
+
+        
+
+    def forward(
+        self,
+        sirna1: torch.Tensor,
+        sirna2: torch.Tensor,
+        mrna1: torch.Tensor,
+        mrna2: torch.Tensor,
+        prior1: torch.Tensor | None = None,
+        prior2: torch.Tensor | None = None,
+    ):
+        y1_reg, y1_cls = self.forward_once(sirna1, mrna1, prior1)
+        y2_reg, y2_cls = self.forward_once(sirna2, mrna2, prior2)
+
+        # print(y1_reg.shape, y2_cls.shape)
+        
+        return y1_reg, y1_cls, y2_reg, y2_cls
