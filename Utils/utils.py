@@ -13,6 +13,7 @@ plt.switch_backend('agg')
 import torch.backends.cudnn as cudnn
 import pandas as pd
 
+
 def log(filename='logging.txt'):
 	pcc, spcc, mcc, auc, prc = [], [], [], [], []
 
@@ -22,7 +23,7 @@ def log(filename='logging.txt'):
 			line = line.split(',')
 			pcc.append(float(line[0].split(':')[-1].strip()))
 			spcc.append(float(line[1].split(':')[-1].strip()))
-			# mcc.append(float(line[2].split(':')[-1].strip()))
+			# mcc.标签必须是二进制append(float(line[2].split(':')[-1].strip()))
 			auc.append(float(line[2].split(':')[-1].strip()))
 			# prc.append(float(line[4].split(':')[-1].strip()))
 				
@@ -39,6 +40,7 @@ def init_seed(SEED):
 	cudnn.enabled = True
 	cudnn.deterministic = True
 	cudnn.benchmark = False
+
 
 def compute_roc_curve(truth, prediction, thred = 0.7, if_save_img=False, title=None, save_path=None):
 	truth = (truth>thred)
